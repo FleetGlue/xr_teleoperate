@@ -59,12 +59,19 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, enable_head_tracking = False):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        # FleetGlue (issue 0004 / head tracking): when True, the publish loop drives
+        # the 3-DOF waist (yaw / roll / pitch joints 12-14) from `self.waist_target`
+        # instead of holding the lock pose. ctrl_waist() sets the target with a simple
+        # first-order low-pass to smooth Quest head-pose jitter.
+        self.enable_head_tracking = enable_head_tracking
+        self.waist_target = np.zeros(3)   # [yaw, roll, pitch] — matches joint order kWaistYaw=12, kWaistRoll=13, kWaistPitch=14
+        self.waist_lpf_alpha = 0.25       # LPF: new = alpha*input + (1-alpha)*prev. Larger = more responsive, more jitter.
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -111,6 +118,12 @@ class G1_29_ArmController:
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
+        # FleetGlue (head tracking): waist joints 12/13/14 get softer gains when head
+        # tracking is on so operator head motion doesn't snap the torso. Otherwise the
+        # existing strong-gain lock at the current pose stands.
+        waist_indices = {G1_29_JointIndex.kWaistYaw.value,
+                         G1_29_JointIndex.kWaistRoll.value,
+                         G1_29_JointIndex.kWaistPitch.value}
         for id in G1_29_JointIndex:
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
@@ -120,6 +133,10 @@ class G1_29_ArmController:
                 else:
                     self.msg.motor_cmd[id].kp = self.kp_low
                     self.msg.motor_cmd[id].kd = self.kd_low
+            elif self.enable_head_tracking and id.value in waist_indices:
+                # softer than the default to reduce shudder when head-pose jitter feeds in
+                self.msg.motor_cmd[id].kp = self.kp_low
+                self.msg.motor_cmd[id].kd = self.kd_low
             else:
                 if self._Is_weak_motor(id):
                     self.msg.motor_cmd[id].kp = self.kp_low
@@ -128,6 +145,14 @@ class G1_29_ArmController:
                     self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
+        # FleetGlue (head tracking): seed waist_target from the current waist joint
+        # positions so ctrl_waist's LPF starts at "no command yet = stay where you are".
+        if self.enable_head_tracking:
+            self.waist_target = np.array([
+                self.all_motor_q[G1_29_JointIndex.kWaistYaw.value],
+                self.all_motor_q[G1_29_JointIndex.kWaistRoll.value],
+                self.all_motor_q[G1_29_JointIndex.kWaistPitch.value],
+            ])
         logger_mp.info("Lock OK!")
 
         # initialize publish thread
@@ -175,7 +200,19 @@ class G1_29_ArmController:
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
+
+            # FleetGlue (head tracking): write the 3-DOF waist target each publish tick.
+            # waist_target is already LPF'd in ctrl_waist; we just hand it to the motor cmd.
+            if self.enable_head_tracking:
+                with self.ctrl_lock:
+                    wy, wr, wp = self.waist_target[0], self.waist_target[1], self.waist_target[2]
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].q = wy
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistRoll].q = wr
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistPitch].q = wp
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].dq = 0
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistRoll].dq = 0
+                self.msg.motor_cmd[G1_29_JointIndex.kWaistPitch].dq = 0
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
@@ -213,6 +250,17 @@ class G1_29_ArmController:
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
+    def ctrl_waist(self, yaw, roll, pitch):
+        '''FleetGlue (head tracking): set 3-DOF waist joint targets in radians.
+        Joint order: [kWaistYaw=12, kWaistRoll=13, kWaistPitch=14]. Caller is responsible
+        for clamping to safe ranges; we apply a first-order low-pass (alpha = waist_lpf_alpha)
+        to smooth Quest head-pose jitter. No effect if enable_head_tracking=False
+        (publish loop ignores waist_target in that case).'''
+        target = np.array([yaw, roll, pitch], dtype=np.float64)
+        with self.ctrl_lock:
+            a = self.waist_lpf_alpha
+            self.waist_target = a * target + (1.0 - a) * self.waist_target
+
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")

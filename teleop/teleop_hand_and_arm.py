@@ -6,8 +6,9 @@ import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
-import os 
+import os
 import sys
+import numpy as np   # FleetGlue (head tracking): used by the Euler-extract block in the main loop
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -82,6 +83,10 @@ if __name__ == '__main__':
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
+    parser.add_argument('--head-tracking', action='store_true',
+                        help='FleetGlue: drive waist from Quest head pose so the camera follows operator head motion. Only sensible in no-motion mode (FSM 4 / debug) — in --motion mode the FSM owns the waist.')
+    parser.add_argument('--head-tracking-yaw-only', action='store_true',
+                        help='FleetGlue: with --head-tracking, send only yaw to the waist; force pitch=0, roll=0. Safer for free-standing robots (pitch/roll shift COM and can topple G1+ off a winch). Recommended default for training data collection.')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
@@ -146,7 +151,10 @@ if __name__ == '__main__':
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim,
+                                           enable_head_tracking=args.head_tracking)
+            if args.head_tracking and args.motion:
+                logger_mp.warning("[head-tracking] --head-tracking + --motion: FSM owns the waist in motion mode; head tracking may have no effect.")
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -256,6 +264,15 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        # FleetGlue (issue 0005): hand-tracking diagnostic counter — log wrist targets every ~1s.
+        _ht_frame = 0
+        # FleetGlue (head tracking): reference Euler captured on the first tick after `r` so
+        # the operator's "neutral" head pose maps to the robot's "neutral" waist. Otherwise the
+        # operator's natural slight-forward gaze (looking at the Vuer scene) reads as a 15°+
+        # pitch and pegs the clamp continuously.
+        _ht_ref_yaw   = None
+        _ht_ref_pitch = None
+        _ht_ref_roll  = None
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -331,6 +348,62 @@ if __name__ == '__main__':
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
+            # FleetGlue (head tracking): decompose Quest head pose (already in robot frame
+            # via tv_wrapper) into yaw/roll/pitch, subtract the calibration reference captured
+            # at the first tick, clamp to safe ranges, send to waist.
+            if args.head_tracking:
+                _R = tele_data.head_pose[:3, :3]
+                # ZYX Euler (yaw about z, pitch about y, roll about x)
+                _ht_yaw_raw   = float(np.arctan2(_R[1, 0], _R[0, 0]))
+                _ht_pitch_raw = float(np.arctan2(-_R[2, 0], np.sqrt(_R[2, 1] ** 2 + _R[2, 2] ** 2)))
+                _ht_roll_raw  = float(np.arctan2(_R[2, 1], _R[2, 2]))
+                # Capture reference on first valid tick (after Quest VR is up — head_pose != CONST default).
+                # The CONST default has yaw=0/pitch=0/roll=0; if we capture during default state the ref
+                # would be zero, which is fine. Capturing after the first non-default sample is ideal but
+                # adds complexity; first-tick capture handles the common case where VR is already up at `r`-press.
+                if _ht_ref_yaw is None:
+                    _ht_ref_yaw   = _ht_yaw_raw
+                    _ht_ref_pitch = _ht_pitch_raw
+                    _ht_ref_roll  = _ht_roll_raw
+                    logger_mp.info(f"[head-tracking] reference captured: yaw={_ht_ref_yaw:+.3f} pitch={_ht_ref_pitch:+.3f} roll={_ht_ref_roll:+.3f}")
+                # Delta from reference
+                _ht_yaw   = _ht_yaw_raw   - _ht_ref_yaw
+                _ht_pitch = _ht_pitch_raw - _ht_ref_pitch
+                _ht_roll  = _ht_roll_raw  - _ht_ref_roll
+                # Conservative clamps (radians). Yaw ±60° is safe (no COM shift); pitch/roll
+                # tightened to ±5° because empirically the operator's natural head motion easily
+                # reaches ±10° pitch + ±8° roll while turning, and that combined posture toppled
+                # the free-standing G1+ on a winch. --head-tracking-yaw-only forces pitch/roll
+                # to 0 entirely for training data collection.
+                _ht_yaw   = max(min(_ht_yaw,   1.05),  -1.05)   # ±60°
+                _ht_pitch = max(min(_ht_pitch, 0.087), -0.087)  # ±5°
+                _ht_roll  = max(min(_ht_roll,  0.087), -0.087)  # ±5°
+                if args.head_tracking_yaw_only:
+                    _ht_pitch = 0.0
+                    _ht_roll  = 0.0
+                arm_ctrl.ctrl_waist(_ht_yaw, _ht_roll, _ht_pitch)
+
+            # FleetGlue (issue 0005): hand-tracking diag — log wrist targets at ~1Hz so we can
+            # numerically fit the head-to-waist Z offset and scale_arms parameters. Remove after.
+            _ht_frame += 1
+            if _ht_frame % 30 == 0:
+                _lp = tele_data.left_wrist_pose[:3, 3]
+                _rp = tele_data.right_wrist_pose[:3, 3]
+                _qstr = ",".join(f"{q:+.2f}" for q in sol_q)
+                # FleetGlue (head tracking diag): also dump the head Euler we extracted + the
+                # current LPF'd waist target the publish loop is sending each tick.
+                if args.head_tracking:
+                    _wt = arm_ctrl.waist_target
+                    _hp_t = tele_data.head_pose[:3, 3]
+                    logger_mp.info(f"[HT-DIAG #{_ht_frame} HEAD] "
+                                   f"head_t=({_hp_t[0]:+.3f},{_hp_t[1]:+.3f},{_hp_t[2]:+.3f}) "
+                                   f"euler=(yaw={_ht_yaw:+.3f},pitch={_ht_pitch:+.3f},roll={_ht_roll:+.3f}) "
+                                   f"waist_target=(yaw={_wt[0]:+.3f},roll={_wt[1]:+.3f},pitch={_wt[2]:+.3f})")
+                logger_mp.info(f"[HT-DIAG #{_ht_frame}] "
+                               f"L=({_lp[0]:+.3f},{_lp[1]:+.3f},{_lp[2]:+.3f}) "
+                               f"R=({_rp[0]:+.3f},{_rp[1]:+.3f},{_rp[2]:+.3f}) "
+                               f"sol_q=[{_qstr}]")
+
             # record data
             if args.record:
                 READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
@@ -376,6 +449,14 @@ if __name__ == '__main__':
                     right_hand_action = []
                     current_body_state = []
                     current_body_action = []
+
+                # FleetGlue (head tracking): when waist tracking is on, record the waist
+                # state + the commanded target so BC policies can learn to use waist yaw.
+                # Order matches arm_ctrl.waist_target = [yaw, roll, pitch] = motor idx 12,13,14.
+                if args.head_tracking:
+                    _all_q = arm_ctrl.get_current_motor_q()
+                    current_body_state  = [float(_all_q[12]), float(_all_q[13]), float(_all_q[14])]
+                    current_body_action = arm_ctrl.waist_target.tolist()
 
                 # arm state and action
                 left_arm_state  = current_lr_arm_q[:7]
