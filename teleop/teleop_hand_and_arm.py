@@ -252,7 +252,7 @@ if __name__ == '__main__':
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+                tv_wrapper.render_to_xr(head_img.bgr)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
@@ -264,7 +264,7 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img)
+                    tv_wrapper.render_to_xr(head_img.bgr)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
