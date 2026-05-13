@@ -468,8 +468,14 @@ if __name__ == '__main__':
                     depths = {}
                     if camera_config['head_camera']['binocular']:
                         if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
-                            colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
+                            # FleetGlue (issue 0008): split using actual image width, not cam_config's
+                            # declared image_shape. In stereo IR mode the teleimager publishes a frame
+                            # that's 2× the configured width (e.g. 1280 wide when cam_config says 640),
+                            # so cam_config[image_shape][1]//2 produces asymmetric halves (320 + 960).
+                            # Using the live array width gives true symmetric halves.
+                            _hw = head_img.bgr.shape[1]
+                            colors[f"color_{0}"] = head_img.bgr[:, :_hw//2]
+                            colors[f"color_{1}"] = head_img.bgr[:, _hw//2:]
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
