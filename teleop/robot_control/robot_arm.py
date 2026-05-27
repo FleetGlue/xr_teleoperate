@@ -113,6 +113,9 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # Keep startup passive: the publish thread uses q_target for arm joints,
+        # so seed it from live encoders before the first rt/arm_sdk write.
+        self.q_target = self.get_current_dual_arm_q()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -281,6 +284,21 @@ class G1_29_ArmController:
                 break
             current_attempts += 1
             time.sleep(0.05)
+
+    def release_arm_sdk(self, duration=1.5, steps=75):
+        '''Ramp arm_sdk control weight to zero after motion-mode arm control.'''
+        if not self.motion_mode:
+            return
+
+        logger_mp.info("[G1_29_ArmController] release_arm_sdk start...")
+        steps = max(1, int(steps))
+        dt = max(0.0, float(duration)) / steps
+        start_weight = float(self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q)
+        for weight in np.linspace(start_weight, 0.0, num=steps + 1)[1:]:
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = float(weight)
+            time.sleep(dt)
+        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 0.0
+        logger_mp.info("[G1_29_ArmController] arm_sdk released.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
