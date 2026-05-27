@@ -99,6 +99,16 @@ if __name__ == '__main__':
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
+    # FleetGlue: lock one or both arms to a fixed home pose so unused-arm operator
+    # jitter doesn't pollute the recorded action stream. Use for single-arm tasks.
+    # The locked arm's wrist target is replaced with a fixed pose before IK; the IK
+    # solver still runs on it, the recorded joint actions are near-constant.
+    parser.add_argument('--lock-arm', type=str, choices=['none', 'left', 'right', 'both'],
+                        default='none',
+                        help='Lock the specified arm(s) to a fixed home pose (arm at side, '
+                             'identity rotation). Operator hand input for the locked arm(s) '
+                             'is ignored. Improves BC data quality for single-arm tasks.')
+
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
 
@@ -247,6 +257,20 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless)
 
+        # FleetGlue: precompute fixed-home wrist poses for the --lock-arm modes.
+        # Values match the IK's "arms at sides, identity rotation" default (the same
+        # pose the operator's hand input lands on when at rest, which solves to
+        # near-zero joint angles via the IK).
+        LOCKED_LEFT_POSE = np.eye(4, dtype=np.float64)
+        LOCKED_LEFT_POSE[:3, 3] = [0.25, 0.15, 0.08]
+        LOCKED_RIGHT_POSE = np.eye(4, dtype=np.float64)
+        LOCKED_RIGHT_POSE[:3, 3] = [0.25, -0.15, 0.08]
+        _LOCK_LEFT = args.lock_arm in ('left', 'both')
+        _LOCK_RIGHT = args.lock_arm in ('right', 'both')
+        if _LOCK_LEFT or _LOCK_RIGHT:
+            logger_mp.info(f"🔒  --lock-arm={args.lock_arm}: locked arm(s) ignore operator hand input "
+                           f"and hold a fixed home pose.")
+
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
@@ -342,8 +366,13 @@ if __name__ == '__main__':
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
+            # FleetGlue (--lock-arm): override the locked arm's wrist target with a fixed
+            # home pose so operator hand input on that side is ignored. Reduces variance
+            # in the recorded action stream for single-arm BC tasks.
+            _left_target  = LOCKED_LEFT_POSE  if _LOCK_LEFT  else tele_data.left_wrist_pose
+            _right_target = LOCKED_RIGHT_POSE if _LOCK_RIGHT else tele_data.right_wrist_pose
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            sol_q, sol_tauff  = arm_ik.solve_ik(_left_target, _right_target, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
