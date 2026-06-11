@@ -175,7 +175,12 @@ class G1_29_ArmController:
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
                 self.lowstate_buffer.SetData(lowstate)
-            time.sleep(0.002)
+            # FleetGlue perf (2026-06-11): poll arm feedback at ~100 Hz, not 500 Hz.
+            # py-spy showed this loop deserializing the full hg_LowState (35 motors
+            # + IMU + BMS, pure-python cyclonedds) at 500 Hz was ~16% of a core +
+            # most of the cyclonedds (de)serialize cost — the teleop-over-WiFi
+            # bottleneck (NOT IK). 100 Hz is ample feedback for 30 Hz control.
+            time.sleep(0.01)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
         current_q = self.get_current_dual_arm_q()
